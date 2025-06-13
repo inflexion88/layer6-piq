@@ -1,0 +1,319 @@
+# PiQ Agent V‑1 – repo drop
+
+Below is a **single‑file dump** you can copy‑paste into a fresh repo, then split into the indicated paths.  Every section begins with `=== PATH: … ===`.  After pasting, run the small shell script at the end to explode the file back into real folders/files.
+
+---
+
+```bash
+#!/usr/bin/env bash
+# explode.sh – run once inside repo root
+grep -n "^=== PATH:" "$0" | cut -d: -f1 | while read -r line; do sed -n "$((line+1)),\$p" "$0" | awk '/^=== PATH:/{exit}{print}' >"$(sed -n "${line}p" "$0" | cut -d' ' -f3)"; done; exit 0
+```
+
+---
+
+\=== PATH: README.md ===
+
+````md
+# PiQ Positioning‑IQ Agent (V‑1)
+
+*Good headline → good sub‑head → clear conversion mechanism.*
+
+This repo contains a **minimal but complete** agentic stack that:
+1. Ingests a visitor prompt (UX copy, page URL, etc.)
+2. Feeds it – together with memory – to an LLM (OpenAI GPT‑4 or DeepSeek R1)
+3. Returns an “immersive‑experience” suggestion (headline, sub‑head, CTA, layout hints) **or** triggers a registered tool (calculator, audit, etc.).
+
+> V‑1 = deploy‑today skeleton.  V‑2 (in a private branch) will add multi‑agent planning & auto‑optimisation.
+
+## Quick Start
+```bash
+cp .env.example .env     # add your key(s)
+poetry install           # or: pip -r requirements.txt
+python -m src.agent_cli  # interactive demo
+````
+
+## Run as API
+
+```bash
+uvicorn src.app:app --host 0.0.0.0 --port 8000
+```
+
+## File map
+
+```
+├── src
+│   ├── agent.py          # brain / main loop
+│   ├── agent_cli.py      # tiny REPL wrapper
+│   ├── app.py            # FastAPI wrapper for Web
+│   ├── tools
+│   │   ├── __init__.py   # TOOL registry
+│   │   └── calc.py       # sample calculator tool
+│   └── memory
+│       ├── vector_store.py
+│       └── short_term.py
+├── prompts/
+│   ├── agent_system.md
+│   └── tools.md
+├── tests/
+│   └── test_happy_path.py
+├── examples/
+│   └── quickstart.py
+├── .env.example
+├── config/default.yaml
+└── pyproject.toml  (or requirements.txt)
+```
+
+MIT License – use, fork, monetise.
+
+````
+
+=== PATH: .env.example ===
+```env
+OPENAI_API_KEY=
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1/chat/completions
+MODEL=gpt-4o
+````
+
+\=== PATH: config/default.yaml ===
+
+```yaml
+model: ${MODEL}
+temperature: 0.4
+max_tokens: 1024
+vector_db: "./data/faiss_index"
+```
+
+\=== PATH: pyproject.toml ===
+
+```toml
+[tool.poetry]
+name = "piq-agent"
+version = "0.1.0"
+description = "Positioning‑IQ agent skeleton"
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+openai = "^1.30.0"
+fastapi = "^0.110.0"
+uvicorn = "^0.29.0"
+tqdm = "*"
+python-dotenv = "*"
+faiss-cpu = "*"
+Pillow = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+ruff = "*"
+```
+
+\=== PATH: prompts/agent\_system.md ===
+
+```text
+You are **PiQ Agent v1**, a positioning optimiser.  Your goal: return JSON with either:
+1. {"type":"tool_call", "name":<TOOL>, "arguments": {...}}
+2. {"type":"response", "headline":..., "subhead":..., "cta":..., "layout_hints":...}
+Follow the “tools.md” instructions for function‑calling format.
+```
+
+\=== PATH: prompts/tools.md ===
+
+````text
+## Registered tools
+- calculator – perform numeric scorecards & ROI calcs.
+- audit – crawl URL and return SEO / UX scores.  
+
+### Tool‑call schema
+Return exactly:
+```json
+{"type":"tool_call","name":"<tool_name>","arguments":{...}}
+````
+
+No additional keys, no narration.
+
+````
+
+=== PATH: src/agent.py ===
+```python
+"""Core loop – importable by CLI or API."""
+from __future__ import annotations
+import os, json, pathlib
+from dotenv import load_dotenv
+from openai import OpenAI
+from .memory.vector_store import VectorStore
+from .memory.short_term import ShortMemory
+from .tools import TOOLS
+
+load_dotenv()
+client = OpenAI()
+BASE = pathlib.Path(__file__).resolve().parent.parent
+
+with open(BASE / "prompts/agent_system.md") as f:
+    SYSTEM_PROMPT = f.read()
+with open(BASE / "prompts/tools.md") as f:
+    TOOLS_PROMPT = f.read()
+
+vs = VectorStore(path=str(BASE / "data/faiss_index"))
+sm = ShortMemory(maxlen=6)
+
+
+def agent_loop(user_msg: str) -> str:
+    sm.push({"role": "user", "content": user_msg})
+    context = vs.similarity_search(user_msg, k=3)
+    messages = (
+        [{"role": "system", "content": SYSTEM_PROMPT + "\n" + TOOLS_PROMPT}]
+        + context
+        + sm.get()
+    )
+    response = client.chat.completions.create(
+        model=os.getenv("MODEL", "gpt-4o"),
+        temperature=float(os.getenv("TEMP", 0.4)),
+        messages=messages,
+        tools=[t.schema for t in TOOLS.values()],
+    ).choices[0].message
+
+    content = response.content or ""
+    if response.tool_calls:
+        tc = response.tool_calls[0]
+        tool_fn = TOOLS[tc.function.name].func
+        tool_args = json.loads(tc.function.arguments or "{}")
+        tool_result = tool_fn(**tool_args)
+        sm.push({"role": "assistant", "content": json.dumps(tool_result)})
+        return json.dumps(tool_result)
+    else:
+        sm.push({"role": "assistant", "content": content})
+        return content
+````
+
+\=== PATH: src/agent\_cli.py ===
+
+```python
+#!/usr/bin/env python
+from .agent import agent_loop
+print("PiQ Agent – type quit to exit")
+while True:
+    msg = input("you> ")
+    if msg.lower() in {"quit", "exit"}: break
+    print("agent>", agent_loop(msg))
+```
+
+\=== PATH: src/app.py ===
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+from .agent import agent_loop
+app = FastAPI()
+
+class Query(BaseModel):
+    message: str
+
+@app.post("/chat")
+def chat(q: Query):
+    return {"reply": agent_loop(q.message)}
+```
+
+\=== PATH: src/tools/**init**.py ===
+
+```python
+from .calc import calculator_tool
+
+TOOLS = {"calculator": calculator_tool}
+
+__all__ = ["TOOLS"]
+```
+
+\=== PATH: src/tools/calc.py ===
+
+```python
+from typing import Dict, Any
+
+schema = {
+    "name": "calculator",
+    "description": "ROI / maturity calculators",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "inputs": {
+                "type": "array",
+                "items": {"type": "number"}
+            }
+        },
+        "required": ["inputs"]
+    }
+}
+
+
+def func(inputs):
+    score = sum(inputs) / (len(inputs) or 1)
+    return {"score": score, "comment": _judge(score)}
+
+def _judge(s):
+    if s > 8: return "world‑class"
+    if s > 5: return "solid"
+    return "needs work"
+
+# bundle
+calculator_tool = type("Tool", (), {"schema": schema, "func": func})
+```
+
+\=== PATH: src/memory/vector\_store.py ===
+
+```python
+import faiss, os, json
+class VectorStore:
+    def __init__(self, path: str):
+        self.path = path
+        dim = 768
+        self.index = faiss.IndexFlatL2(dim)
+        self.meta = []
+        if os.path.exists(path + ".idx"):
+            faiss.read_index(path + ".idx", self.index)
+            self.meta = json.load(open(path + ".json"))
+    def add(self, embeds, docs):
+        self.index.add(embeds)
+        self.meta.extend(docs)
+    def similarity_search(self, query, k=3):
+        return []  # stub for V‑1
+```
+
+\=== PATH: src/memory/short\_term.py ===
+
+```python
+from collections import deque
+class ShortMemory:
+    def __init__(self, maxlen=6):
+        self.buf = deque(maxlen=maxlen)
+    def push(self, msg):
+        self.buf.append(msg)
+    def get(self):
+        return list(self.buf)
+```
+
+\=== PATH: tests/test\_happy\_path.py ===
+
+```python
+from src.agent import agent_loop
+
+def test_flow():
+    reply = agent_loop("Rate my headline: 'Free ROI Calculator'")
+    assert reply, "Got empty reply"
+```
+
+\=== PATH: examples/quickstart.py ===
+
+```python
+from src.agent import agent_loop
+print(agent_loop("Optimise this page: example.com/pricing"))
+```
+
+---
+
+**How to use:**
+
+1. Save this file as `drop.txt` in your new repo.
+2. `bash drop.txt` – shell snippet at top will auto‑explode into files.
+3. `poetry install && python -m src.agent_cli` to chat.
+
+V‑1 done – ready for your Codex refactor.
